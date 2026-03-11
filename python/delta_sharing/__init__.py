@@ -15,6 +15,7 @@
 #
 
 from delta_sharing.delta_sharing import (
+    DeltaSharingChanges,
     DeltaSharingSnapshot,
     DeltaSharingTable,
     SharingClient,
@@ -32,6 +33,7 @@ __all__ = [
     "SharingClient",
     "DeltaSharingTable",
     "DeltaSharingSnapshot",
+    "DeltaSharingChanges",
     "Share",
     "Schema",
     "Table",
