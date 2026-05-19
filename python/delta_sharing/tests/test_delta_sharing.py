@@ -17,6 +17,7 @@ from datetime import date, datetime
 from typing import Optional, Sequence
 
 import pandas as pd
+import pyarrow as pa
 import pytest
 
 from delta_sharing.delta_sharing import (
@@ -28,6 +29,7 @@ from delta_sharing.delta_sharing import (
     get_table_metadata,
     get_table_protocol,
     get_table_version,
+    load_as_arrow,
     load_as_pandas,
     load_as_spark,
     load_table_changes_as_spark,
@@ -269,6 +271,70 @@ def test_delta_sharing_table_snapshot_to_pandas(tmp_path):
     }
 
 
+def test_delta_sharing_table_snapshot_to_arrow(tmp_path):
+    source = pd.DataFrame({"value": [1, 2], "label": ["a", "b"]})
+    parquet_path = tmp_path / "snapshot_arrow.parquet"
+    source.to_parquet(parquet_path)
+
+    class RestClientMock:
+        def list_files_in_table(
+            self,
+            table: Table,
+            *,
+            predicateHints: Optional[Sequence[str]] = None,
+            jsonPredicateHints: Optional[str] = None,
+            limitHint: Optional[int] = None,
+            version: Optional[int] = None,
+            timestamp: Optional[str] = None,
+        ) -> ListFilesInTableResponse:
+            assert table == Table(name="table", share="share", schema="schema")
+            assert limitHint == 10
+            assert version == 2
+            assert timestamp == "2024-01-01T00:00:00Z"
+            assert jsonPredicateHints == '{"op":"equal"}'
+
+            metadata = Metadata(
+                schema_string=(
+                    '{"fields":['
+                    '{"metadata":{},"name":"value","nullable":true,"type":"long"},'
+                    '{"metadata":{},"name":"label","nullable":true,"type":"string"}'
+                    '],"type":"struct"}'
+                )
+            )
+            return ListFilesInTableResponse(
+                delta_table_version=1,
+                protocol=None,
+                metadata=metadata,
+                add_files=[
+                    AddFile(
+                        url=str(parquet_path),
+                        id="snapshot",
+                        partition_values={},
+                        size=0,
+                        stats="",
+                    )
+                ],
+                lines=[],
+            )
+
+    table = DeltaSharingTable(
+        Table(name="table", share="share", schema="schema"),
+        RestClientMock(),
+    )
+    snapshot = table.snapshot(
+        limit=10,
+        version=2,
+        timestamp="2024-01-01T00:00:00Z",
+        jsonPredicateHints='{"op":"equal"}',
+        use_delta_format=False,
+    )
+    expected = pa.Table.from_pandas(source, preserve_index=False)
+
+    assert snapshot.to_arrow().equals(expected)
+    assert pa.Table.from_batches(list(snapshot.to_record_batches())).equals(expected)
+    assert snapshot.to_record_batch_reader().read_all().equals(expected)
+
+
 def test_delta_sharing_table_changes_to_pandas(tmp_path):
     source = pd.DataFrame({"value": [1, 2], "label": ["a", "b"]})
     parquet_path = tmp_path / "table_changes.parquet"
@@ -334,6 +400,72 @@ def test_delta_sharing_table_changes_to_pandas(tmp_path):
             include_historical_metadata=False,
         ),
     }
+
+
+def test_delta_sharing_table_changes_to_arrow(tmp_path):
+    source = pd.DataFrame({"value": [1, 2], "label": ["a", "b"]})
+    parquet_path = tmp_path / "table_changes_arrow.parquet"
+    source.to_parquet(parquet_path)
+
+    class RestClientMock:
+        def list_table_changes(
+            self, table: Table, cdfOptions: CdfOptions
+        ) -> ListTableChangesResponse:
+            assert table == Table(name="table", share="share", schema="schema")
+            assert cdfOptions == CdfOptions(
+                starting_version=1,
+                ending_version=2,
+                starting_timestamp="2024-01-01T00:00:00Z",
+                ending_timestamp="2024-01-02T00:00:00Z",
+                include_historical_metadata=False,
+            )
+
+            metadata = Metadata(
+                schema_string=(
+                    '{"fields":['
+                    '{"metadata":{},"name":"value","nullable":true,"type":"long"},'
+                    '{"metadata":{},"name":"label","nullable":true,"type":"string"}'
+                    '],"type":"struct"}'
+                )
+            )
+            return ListTableChangesResponse(
+                protocol=None,
+                metadata=metadata,
+                actions=[
+                    AddFile(
+                        url=str(parquet_path),
+                        id="table_changes",
+                        partition_values={},
+                        size=0,
+                        stats="",
+                        timestamp=12345,
+                        version=2,
+                    )
+                ],
+                lines=[],
+            )
+
+    table = DeltaSharingTable(
+        Table(name="table", share="share", schema="schema"),
+        RestClientMock(),
+    )
+    changes = table.changes(
+        starting_version=1,
+        ending_version=2,
+        starting_timestamp="2024-01-01T00:00:00Z",
+        ending_timestamp="2024-01-02T00:00:00Z",
+        use_delta_format=False,
+    )
+
+    expected_pdf = source.copy()
+    expected_pdf["_change_type"] = "insert"
+    expected_pdf["_commit_version"] = 2
+    expected_pdf["_commit_timestamp"] = 12345
+    expected = pa.Table.from_pandas(expected_pdf, preserve_index=False)
+
+    assert changes.to_arrow().equals(expected)
+    assert pa.Table.from_batches(list(changes.to_record_batches())).equals(expected)
+    assert changes.to_record_batch_reader().read_all().equals(expected)
 
 
 def test_delta_sharing_table_metadata_removes_capabilities_header_after_failure():
@@ -1069,6 +1201,26 @@ def test_load_as_pandas_legacy_and_table_handle_match(
     )
 
     pd.testing.assert_frame_equal(legacy_pdf, table_pdf)
+
+
+@pytest.mark.skipif(not ENABLE_INTEGRATION, reason=SKIP_MESSAGE)
+@pytest.mark.parametrize("use_delta_format", [None, True, False])
+def test_load_as_arrow_legacy_and_table_handle_match(
+    profile_path: str, profile: DeltaSharingProfile, use_delta_format: Optional[bool]
+):
+    fragments = "share1.default.table1"
+    limit = 2
+
+    legacy_table = load_as_arrow(
+        f"{profile_path}#{fragments}", limit=limit, use_delta_format=use_delta_format
+    )
+
+    client = SharingClient(profile)
+    table_arrow = (
+        client.table(fragments).snapshot(limit=limit, use_delta_format=use_delta_format).to_arrow()
+    )
+
+    assert legacy_table.equals(table_arrow)
 
 
 @pytest.mark.skipif(not ENABLE_INTEGRATION, reason=SKIP_MESSAGE)

@@ -20,8 +20,17 @@ from typing import Optional, Sequence
 
 import pandas as pd
 import numpy as np
+import pyarrow as pa
 
-from delta_sharing.protocol import AddFile, AddCdcFile, CdfOptions, Metadata, RemoveFile, Table
+from delta_sharing.protocol import (
+    AddFile,
+    AddCdcFile,
+    CdfOptions,
+    Metadata,
+    Protocol,
+    RemoveFile,
+    Table,
+)
 from delta_sharing.reader import DeltaSharingReader
 from delta_sharing.rest_client import (
     ListFilesInTableResponse,
@@ -65,6 +74,301 @@ def test_to_pandas_delta_format_removes_header_after_failure():
         reader.to_pandas()
 
     assert rest_client.delta_format_removed
+
+
+def test_to_record_batches_delta_format_removes_header_after_failure():
+    class RestClientMock:
+        delta_format_removed = False
+
+        def set_delta_format_header(self, for_cdf=False):
+            return
+
+        def list_files_in_table(
+            self,
+            table: Table,
+            *,
+            predicateHints: Optional[Sequence[str]] = None,
+            jsonPredicateHints: Optional[str] = None,
+            limitHint: Optional[int] = None,
+            version: Optional[int] = None,
+            timestamp: Optional[int] = None,
+        ) -> ListFilesInTableResponse:
+            assert table == Table("table_name", "share_name", "schema_name")
+            raise RuntimeError("list files failed")
+
+        def remove_delta_format_header(self):
+            self.delta_format_removed = True
+
+    rest_client = RestClientMock()
+    reader = DeltaSharingReader(
+        Table("table_name", "share_name", "schema_name"),
+        rest_client,
+        use_delta_format=True,
+    )
+
+    with pytest.raises(RuntimeError, match="list files failed"):
+        reader.to_record_batches()
+
+    assert rest_client.delta_format_removed
+
+
+def test_to_record_batches_delta_format_removes_header_before_consumption():
+    schema_string = (
+        '{"type":"struct","fields":[' '{"metadata":{},"name":"a","nullable":true,"type":"long"}]}'
+    )
+    escaped_schema_string = schema_string.replace('"', '\\"')
+    lines = [
+        '{"protocol":{"deltaProtocol":{"minReaderVersion":1,"minWriterVersion":2}}}',
+        (
+            '{"metaData":{"deltaMetadata":{'
+            '"id":"id",'
+            '"format":{"provider":"parquet","options":{}},'
+            f'"schemaString":"{escaped_schema_string}",'
+            '"partitionColumns":[],'
+            '"configuration":{}'
+            "}}}"
+        ),
+    ]
+
+    class RestClientMock:
+        delta_format_removed = False
+
+        def set_delta_format_header(self, for_cdf=False):
+            assert not for_cdf
+
+        def list_files_in_table(
+            self,
+            table: Table,
+            *,
+            predicateHints: Optional[Sequence[str]] = None,
+            jsonPredicateHints: Optional[str] = None,
+            limitHint: Optional[int] = None,
+            version: Optional[int] = None,
+            timestamp: Optional[int] = None,
+        ) -> ListFilesInTableResponse:
+            assert table == Table("table_name", "share_name", "schema_name")
+            return ListFilesInTableResponse(
+                delta_table_version=0,
+                protocol=Protocol(1),
+                metadata=Metadata(schema_string=schema_string),
+                add_files=[],
+                lines=list(lines),
+            )
+
+        def remove_delta_format_header(self):
+            self.delta_format_removed = True
+
+    rest_client = RestClientMock()
+    reader = DeltaSharingReader(
+        Table("table_name", "share_name", "schema_name"),
+        rest_client,
+        use_delta_format=True,
+    )
+
+    batches = reader.to_record_batches()
+
+    assert rest_client.delta_format_removed
+    assert list(batches) == []
+
+
+def test_to_arrow_non_partitioned(tmp_path):
+    pdf1 = pd.DataFrame({"a": [1, 2, 3], "b": ["a", "b", "c"]})
+    pdf2 = pd.DataFrame({"a": [4, 5, 6], "b": ["d", "e", "f"]})
+
+    pdf1.to_parquet(tmp_path / "pdf1.parquet")
+    pdf2.to_parquet(tmp_path / "pdf2.parquet")
+
+    class RestClientMock:
+        def list_files_in_table(
+            self,
+            table: Table,
+            *,
+            predicateHints: Optional[Sequence[str]] = None,
+            jsonPredicateHints: Optional[str] = None,
+            limitHint: Optional[int] = None,
+            version: Optional[int] = None,
+            timestamp: Optional[int] = None,
+        ) -> ListFilesInTableResponse:
+            assert table == Table("table_name", "share_name", "schema_name")
+
+            metadata = Metadata(
+                schema_string=(
+                    '{"fields":['
+                    '{"metadata":{},"name":"a","nullable":true,"type":"long"},'
+                    '{"metadata":{},"name":"b","nullable":true,"type":"string"}'
+                    '],"type":"struct"}'
+                )
+            )
+            return ListFilesInTableResponse(
+                delta_table_version=1,
+                protocol=None,
+                metadata=metadata,
+                add_files=[
+                    AddFile(
+                        url=str(tmp_path / "pdf1.parquet"),
+                        id="pdf1",
+                        partition_values={},
+                        size=0,
+                        stats="",
+                    ),
+                    AddFile(
+                        url=str(tmp_path / "pdf2.parquet"),
+                        id="pdf2",
+                        partition_values={},
+                        size=0,
+                        stats="",
+                    ),
+                ],
+                lines=[],
+            )
+
+    reader = DeltaSharingReader(
+        Table("table_name", "share_name", "schema_name"),
+        RestClientMock(),
+        limit=4,
+        use_delta_format=False,
+    )
+    result = reader.to_arrow()
+    expected = pa.Table.from_pandas(
+        pd.concat([pdf1, pdf2]).reset_index(drop=True).head(4), preserve_index=False
+    )
+
+    assert result.equals(expected)
+
+
+def test_to_arrow_casts_timestamp_columns_to_declared_schema(tmp_path):
+    pdf = pd.DataFrame({"ts": pd.to_datetime(["2024-01-01 00:00:00", "2024-01-02 12:34:56"])})
+    pdf.to_parquet(tmp_path / "timestamps.parquet")
+
+    class RestClientMock:
+        def list_files_in_table(
+            self,
+            table: Table,
+            *,
+            predicateHints: Optional[Sequence[str]] = None,
+            jsonPredicateHints: Optional[str] = None,
+            limitHint: Optional[int] = None,
+            version: Optional[int] = None,
+            timestamp: Optional[int] = None,
+        ) -> ListFilesInTableResponse:
+            metadata = Metadata(
+                schema_string=(
+                    '{"fields":['
+                    '{"metadata":{},"name":"ts","nullable":true,"type":"timestamp"}'
+                    '],"type":"struct"}'
+                )
+            )
+            return ListFilesInTableResponse(
+                delta_table_version=1,
+                protocol=None,
+                metadata=metadata,
+                add_files=[
+                    AddFile(
+                        url=str(tmp_path / "timestamps.parquet"),
+                        id="timestamps",
+                        partition_values={},
+                        size=0,
+                        stats="",
+                    )
+                ],
+                lines=[],
+            )
+
+    reader = DeltaSharingReader(
+        Table("table_name", "share_name", "schema_name"),
+        RestClientMock(),
+        use_delta_format=False,
+    )
+    result = reader.to_arrow()
+
+    assert result.schema.field("ts").type == pa.timestamp("ns")
+
+
+def test_to_record_batches_partitioned(tmp_path):
+    pdf1 = pd.DataFrame({"a": [1, 2, 3]})
+    pdf2 = pd.DataFrame({"a": [4, 5, 6]})
+
+    pdf1.to_parquet(tmp_path / "pdf1.parquet")
+    pdf2.to_parquet(tmp_path / "pdf2.parquet")
+
+    class RestClientMock:
+        def list_files_in_table(
+            self,
+            table: Table,
+            *,
+            predicateHints: Optional[Sequence[str]] = None,
+            jsonPredicateHints: Optional[str] = None,
+            limitHint: Optional[int] = None,
+            version: Optional[int] = None,
+            timestamp: Optional[int] = None,
+        ) -> ListFilesInTableResponse:
+            metadata = Metadata(
+                schema_string=(
+                    '{"fields":['
+                    '{"metadata":{},"name":"a","nullable":true,"type":"long"},'
+                    '{"metadata":{},"name":"b","nullable":true,"type":"string"}'
+                    '],"type":"struct"}'
+                )
+            )
+            return ListFilesInTableResponse(
+                delta_table_version=1,
+                protocol=None,
+                metadata=metadata,
+                add_files=[
+                    AddFile(
+                        url=str(tmp_path / "pdf1.parquet"),
+                        id="pdf1",
+                        partition_values={"b": "x"},
+                        size=0,
+                        stats="",
+                    ),
+                    AddFile(
+                        url=str(tmp_path / "pdf2.parquet"),
+                        id="pdf2",
+                        partition_values={"b": "y"},
+                        size=0,
+                        stats="",
+                    ),
+                ],
+                lines=[],
+            )
+
+    reader = DeltaSharingReader(
+        Table("table_name", "share_name", "schema_name"),
+        RestClientMock(),
+        limit=4,
+        use_delta_format=False,
+    )
+    batches = list(reader.to_record_batches())
+    result = pa.Table.from_batches(batches)
+
+    expected1 = pdf1.copy()
+    expected1["b"] = "x"
+    expected2 = pdf2.copy()
+    expected2["b"] = "y"
+    expected = pa.Table.from_pandas(
+        pd.concat([expected1, expected2]).reset_index(drop=True).head(4),
+        preserve_index=False,
+    )
+
+    assert [batch.num_rows for batch in batches] == [3, 1]
+    assert result.equals(expected)
+
+    reader = DeltaSharingReader(
+        Table("table_name", "share_name", "schema_name"),
+        RestClientMock(),
+        use_delta_format=False,
+    )
+    assert (
+        reader.to_record_batch_reader()
+        .read_all()
+        .equals(
+            pa.Table.from_pandas(
+                pd.concat([expected1, expected2]).reset_index(drop=True),
+                preserve_index=False,
+            )
+        )
+    )
 
 
 def test_to_pandas_non_partitioned(tmp_path):
@@ -699,6 +1003,221 @@ def test_table_changes_empty(tmp_path):
     )
     pdf = reader.table_changes_to_pandas(CdfOptions())
     validate_pdf(pdf)
+
+
+def test_table_changes_to_arrow_non_partitioned(tmp_path):
+    pdf = pd.DataFrame({"a": [1, 2, 3], "b": ["a", "b", "c"]})
+    pdf.to_parquet(tmp_path / "changes.parquet")
+
+    timestamp = 1652110000000
+    version = 1
+
+    class RestClientMock:
+        def list_table_changes(
+            self, table: Table, cdfOptions: CdfOptions
+        ) -> ListTableChangesResponse:
+            assert table == Table("table_name", "share_name", "schema_name")
+
+            metadata = Metadata(
+                schema_string=(
+                    '{"fields":['
+                    '{"metadata":{},"name":"a","nullable":true,"type":"long"},'
+                    '{"metadata":{},"name":"b","nullable":true,"type":"string"}'
+                    '],"type":"struct"}'
+                )
+            )
+            return ListTableChangesResponse(
+                protocol=None,
+                metadata=metadata,
+                actions=[
+                    AddFile(
+                        url=str(tmp_path / "changes.parquet"),
+                        id="changes",
+                        partition_values={},
+                        size=0,
+                        stats="",
+                        timestamp=timestamp,
+                        version=version,
+                    )
+                ],
+                lines=None,
+            )
+
+    reader = DeltaSharingReader(
+        Table("table_name", "share_name", "schema_name"),
+        RestClientMock(),
+        use_delta_format=False,
+    )
+    result = reader.table_changes_to_arrow(CdfOptions())
+
+    expected_pdf = pdf.copy()
+    expected_pdf[DeltaSharingReader._change_type_col_name()] = "insert"
+    expected_pdf[DeltaSharingReader._commit_version_col_name()] = version
+    expected_pdf[DeltaSharingReader._commit_timestamp_col_name()] = timestamp
+    expected = pa.Table.from_pandas(expected_pdf, preserve_index=False)
+
+    assert result.equals(expected)
+
+
+def test_table_changes_to_record_batch_reader_partitioned(tmp_path):
+    pdf = pd.DataFrame({"a": [1, 2, 3]})
+    pdf[DeltaSharingReader._change_type_col_name()] = "update_postimage"
+    pdf.to_parquet(tmp_path / "changes.parquet")
+
+    timestamp = 1652110000000
+    version = 1
+
+    class RestClientMock:
+        def list_table_changes(
+            self, table: Table, cdfOptions: CdfOptions
+        ) -> ListTableChangesResponse:
+            metadata = Metadata(
+                schema_string=(
+                    '{"fields":['
+                    '{"metadata":{},"name":"a","nullable":true,"type":"long"},'
+                    '{"metadata":{},"name":"b","nullable":true,"type":"string"}'
+                    '],"type":"struct"}'
+                )
+            )
+            return ListTableChangesResponse(
+                protocol=None,
+                metadata=metadata,
+                actions=[
+                    AddCdcFile(
+                        url=str(tmp_path / "changes.parquet"),
+                        id="changes",
+                        partition_values={"b": "x"},
+                        size=0,
+                        timestamp=timestamp,
+                        version=version,
+                    )
+                ],
+                lines=None,
+            )
+
+    reader = DeltaSharingReader(
+        Table("table_name", "share_name", "schema_name"),
+        RestClientMock(),
+        use_delta_format=False,
+    )
+    result = reader.table_changes_to_record_batch_reader(CdfOptions()).read_all()
+
+    expected_pdf = pdf.copy()
+    expected_pdf["b"] = "x"
+    expected_pdf[DeltaSharingReader._commit_version_col_name()] = version
+    expected_pdf[DeltaSharingReader._commit_timestamp_col_name()] = timestamp
+    expected = pa.Table.from_pandas(
+        expected_pdf[
+            [
+                "a",
+                "b",
+                DeltaSharingReader._change_type_col_name(),
+                DeltaSharingReader._commit_version_col_name(),
+                DeltaSharingReader._commit_timestamp_col_name(),
+            ]
+        ],
+        preserve_index=False,
+    )
+
+    assert result.equals(expected)
+
+
+def test_table_changes_to_record_batches_delta_format_removes_header_after_failure():
+    class RestClientMock:
+        delta_format_removed = False
+
+        def set_delta_format_header(self, for_cdf=False):
+            assert for_cdf
+
+        def list_table_changes(
+            self, table: Table, cdfOptions: CdfOptions
+        ) -> ListTableChangesResponse:
+            assert table == Table("table_name", "share_name", "schema_name")
+            raise RuntimeError("list changes failed")
+
+        def remove_delta_format_header(self):
+            self.delta_format_removed = True
+
+    rest_client = RestClientMock()
+    reader = DeltaSharingReader(
+        Table("table_name", "share_name", "schema_name"),
+        rest_client,
+        use_delta_format=True,
+    )
+
+    with pytest.raises(RuntimeError, match="list changes failed"):
+        reader.table_changes_to_record_batches(CdfOptions())
+
+    assert rest_client.delta_format_removed
+
+
+def test_table_changes_to_record_batches_delta_format_removes_header_before_consumption(tmp_path):
+    parquet_file = tmp_path / "change.parquet"
+    pd.DataFrame({"a": [1]}).to_parquet(parquet_file)
+
+    schema_string = (
+        '{"type":"struct","fields":[' '{"metadata":{},"name":"a","nullable":true,"type":"long"}]}'
+    )
+    escaped_schema_string = schema_string.replace('"', '\\"')
+    lines = [
+        '{"protocol":{"deltaProtocol":{"minReaderVersion":1,"minWriterVersion":2}}}',
+        (
+            '{"metaData":{'
+            '"version":0,'
+            '"deltaMetadata":{'
+            '"id":"id",'
+            '"format":{"provider":"parquet","options":{}},'
+            f'"schemaString":"{escaped_schema_string}",'
+            '"partitionColumns":[],'
+            '"configuration":{"delta.enableChangeDataFeed":"true"}'
+            "}}}"
+        ),
+        (
+            '{"file":{'
+            '"id":"change",'
+            '"version":0,'
+            '"timestamp":1000,'
+            '"deltaSingleAction":{'
+            '"add":{'
+            f'"path":"{parquet_file}",'
+            '"partitionValues":{},'
+            '"modificationTime":1000,'
+            '"dataChange":true,'
+            '"size":0'
+            "}}}}"
+        ),
+    ]
+
+    class RestClientMock:
+        delta_format_removed = False
+
+        def set_delta_format_header(self, for_cdf=False):
+            assert for_cdf
+
+        def list_table_changes(
+            self, table: Table, cdfOptions: CdfOptions
+        ) -> ListTableChangesResponse:
+            assert table == Table("table_name", "share_name", "schema_name")
+            return ListTableChangesResponse(
+                protocol=None, metadata=None, actions=None, lines=list(lines)
+            )
+
+        def remove_delta_format_header(self):
+            self.delta_format_removed = True
+
+    rest_client = RestClientMock()
+    reader = DeltaSharingReader(
+        Table("table_name", "share_name", "schema_name"),
+        rest_client,
+        use_delta_format=True,
+    )
+
+    batches = reader.table_changes_to_record_batches(CdfOptions())
+
+    assert rest_client.delta_format_removed
+    result = pa.Table.from_batches(list(batches))
+    assert result.column("a").to_pylist() == [1]
+    assert result.column(DeltaSharingReader._change_type_col_name()).to_pylist() == ["insert"]
 
 
 def test_table_changes_to_pandas_non_partitioned_delta(tmp_path):
