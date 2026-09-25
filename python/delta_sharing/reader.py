@@ -515,9 +515,6 @@ class DeltaSharingReader:
         schema_with_cdf = self._add_special_cdf_schema(schema_json)
         schema = to_arrow_schema(schema_with_cdf)
 
-        if len(response.actions) == 0:
-            return schema, iter(())
-
         def iterator() -> Iterator[pa.RecordBatch]:
             for action in response.actions:
                 for batch in DeltaSharingReader._to_record_batches(
@@ -575,9 +572,12 @@ class DeltaSharingReader:
         """
         Batches are produced lazily; read the reader fully (or close it) so that
         temporary resources backing the stream are released promptly.
+        Errors during consumption may be wrapped in Arrow exceptions.
         """
         schema, batches = self._table_changes_to_arrow_stream(cdfOptions)
-        return pa.RecordBatchReader.from_batches(schema, batches)
+        # The C stream transfer makes close() release the Python iterator and its
+        # temporary resources; from_batches() alone retains them until destruction.
+        return pa.RecordBatchReader.from_stream(pa.RecordBatchReader.from_batches(schema, batches))
 
     def _copy(
         self,

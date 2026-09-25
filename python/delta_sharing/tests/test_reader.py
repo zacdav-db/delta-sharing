@@ -16,6 +16,8 @@
 import pytest
 
 from datetime import date
+from pathlib import Path
+import tempfile
 from typing import Optional, Sequence, Tuple
 
 import pandas as pd
@@ -943,6 +945,9 @@ def test_table_changes_empty(tmp_path):
     pdf = reader.table_changes_to_pandas(CdfOptions())
     validate_pdf(pdf)
     validate_pdf(reader.table_changes_to_arrow(CdfOptions()).to_pandas())
+    batches = reader.table_changes_to_record_batches(CdfOptions())
+    assert list(batches) == []
+    batches.close()
 
     reader = DeltaSharingReader(
         Table("table_name", "share_name", "schema_name"), RestClientMock(), convert_in_batches=True
@@ -1000,7 +1005,9 @@ def test_table_changes_to_record_batches_delta_format_removes_header_after_failu
     assert rest_client.delta_format_removed
 
 
-def test_table_changes_to_record_batches_delta_format_removes_header_before_consumption(tmp_path):
+@pytest.mark.parametrize("stream_type", ["iterator", "reader", "c_stream"])
+@pytest.mark.parametrize("stage", ["unstarted", "partial", "exhausted"])
+def test_table_changes_delta_format_stream_lifecycle(tmp_path, monkeypatch, stream_type, stage):
     parquet_file = tmp_path / "change.parquet"
     pd.DataFrame({"a": [1]}).to_parquet(parquet_file)
 
@@ -1066,12 +1073,35 @@ def test_table_changes_to_record_batches_delta_format_removes_header_before_cons
         use_delta_format=True,
     )
 
-    batches = reader.table_changes_to_record_batches(CdfOptions())
+    temp_paths = []
+    temporary_directory = tempfile.TemporaryDirectory
+
+    def track_temp_dir():
+        directory = temporary_directory(dir=tmp_path)
+        temp_paths.append(Path(directory.name))
+        return directory
+
+    monkeypatch.setattr("delta_sharing.reader.tempfile.TemporaryDirectory", track_temp_dir)
+    if stream_type == "iterator":
+        stream = reader.table_changes_to_record_batches(CdfOptions())
+    else:
+        stream = reader.table_changes_to_record_batch_reader(CdfOptions())
+        if stream_type == "c_stream":
+            stream = pa.RecordBatchReader.from_stream(stream)
 
     assert rest_client.delta_format_removed
-    result = pa.Table.from_batches(list(batches))
-    assert result.column("a").to_pylist() == [1]
-    assert result.column(DeltaSharingReader._change_type_col_name()).to_pylist() == ["insert"]
+    assert len(temp_paths) == 1 and temp_paths[0].exists()
+    if stage != "unstarted":
+        batches = [next(stream)] if stage == "partial" else list(stream)
+        result = pa.Table.from_batches(batches)
+        assert result.column("a").to_pylist() == [1]
+        assert result.column(DeltaSharingReader._change_type_col_name()).to_pylist() == ["insert"]
+        if stage == "exhausted":
+            assert not temp_paths[0].exists()
+    stream.close()
+    stream.close()
+    # Retain the closed stream to verify cleanup does not depend on its destruction.
+    assert not temp_paths[0].exists()
 
 
 def test_table_changes_to_pandas_non_partitioned_delta(tmp_path):
